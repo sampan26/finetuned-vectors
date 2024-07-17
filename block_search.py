@@ -210,7 +210,7 @@ learning_rate = 5e-5
 batch_size=4
 activation_storage = defaultdict(lambda: defaultdict(list))
 
-fname = 'directions_llama2_13b_f16_persona_lasttoken_pc2raw.pkl'
+fname = 'directions_llama2_7b_f16_persona_lasttoken_pc2raw.pkl'
 with open(outputdir+fname, 'rb') as f:
     directions = pickle.load()
 
