@@ -92,8 +92,8 @@ def load_data_and_setup_dataloader(model):
     pos_label_token_id = model.tokenizer.encode(pos_label)[-1]
     neg_label_token_id = model.tokenizer.encode(neg_label)[-1]
     df = pd.read_csv(datadir+"facts_true_false.csv")
-    true_statements = df[df['label']==1]['statements']
-    false_statements = df[df['label']==0]['statements']
+    true_statements = df[df['label']==1]['statement']
+    false_statements = df[df['label']==0]['statement']
 
     true_statements_train = true_statements.sample(n=306, random_state=42)
     true_statements_test = true_statements.drop(true_statements_train)
@@ -180,7 +180,7 @@ def load_data_and_setup_dataloader(model):
     return dataloader, pos_label_token_id, neg_label_token_id
 
 
-    
+HF_TOKEN = "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"
 outputdir = ""
 datadir = "data/"
 model_path: str = "meta-llama/Llama-2-7b-chat-hf"
@@ -212,7 +212,7 @@ activation_storage = defaultdict(lambda: defaultdict(list))
 
 fname = 'directions_llama2_7b_f16_persona_lasttoken_pc2raw.pkl'
 with open(outputdir+fname, 'rb') as f:
-    directions = pickle.load()
+    directions = pickle.load(f)
 
 for layer, tensors in directions.items():
     directions[layer] = [tensor.to(dtype=torch.float16) for tensor in tensors]
