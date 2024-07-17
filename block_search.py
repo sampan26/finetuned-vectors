@@ -82,8 +82,12 @@ def soft_targets_cross_entropy(logits):
 
 
 def load_data_and_setup_dataloader(model):
-    user_tag, asst_tag = "[INST]", "[/INST]"
-    model_numlayers = model.config.num_hidden_layers
+    if "gpt" in model_path:
+        user_tag, asst_tag = "|<end_of_text>| ", ""
+        model_numlayers = model.config.n_layer
+    else: #/llama/mistral
+        user_tag, asst_tag = "[INST] ", " [/INST]"
+        model_numlayers = model.config.num_hidden_layers
 
     strip_quotes = lambda s: s[1:-1] if len(s) > 1 and (((s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")))) else s
 
@@ -91,24 +95,24 @@ def load_data_and_setup_dataloader(model):
     neg_label = "B"
     pos_label_token_id = model.tokenizer.encode(pos_label)[-1]
     neg_label_token_id = model.tokenizer.encode(neg_label)[-1]
-    df = pd.read_csv(datadir+"facts_true_false.csv")
-    true_statements = df[df['label']==1]['statement']
-    false_statements = df[df['label']==0]['statement']
+    df = pd.read_csv(datadir+"facts_true_false.csv") #train
+    true_statements = df[df['label'] == 1]['statement']
+    false_statements = df[df['label'] == 0]['statement']
 
     true_statements_train = true_statements.sample(n=306, random_state=42)
-    true_statements_test = true_statements.drop(true_statements_train)
-    false_statements_train = false_statements.sample(n=302, random_state=42)
-    false_statements_test = false_statements.drop(false_statements_train)
+    true_statements_test = true_statements.drop(true_statements_train.index)
+    false_statements_train = false_statements.sample(n=306, random_state=42)
+    false_statements_test = false_statements.drop(false_statements_train.index)
 
     def template(stmt: str) -> str:
         return f"{user_tag}<<SYS>> Respond only with the letter A or B <<SYS>> Question: Is the following claim true or false? \"{strip_quotes(stmt)}\"\n\nChoices:\n (A) True\n (B) False\n\nAnswer:{asst_tag} "
-    
+
     train_prompts = []
     train_labels = []
     for i, (truth, lie) in enumerate(zip(true_statements_train.values.tolist(), false_statements_train.values.tolist())):
         train_prompts.append(template(truth))
         train_labels.append(pos_label)
-        train_prompts.append(template(truth))      
+        train_prompts.append(template(truth))
         train_labels.append(neg_label)
         train_prompts.append(template(lie))
         train_labels.append(neg_label)
@@ -118,8 +122,9 @@ def load_data_and_setup_dataloader(model):
     def collate_batch(batch):
         input_ids = [item['input_ids'] for item in batch]
         labels = [item['labels'] for item in batch]
-        attention_masks = [item['attention_mask'] for item in batch]
+        attention_masks = [item['attention_mask'] for item in batch]  # Collect attention masks
 
+        # Pad input_ids, labels, and attention_masks to the maximum length in the batch
         input_ids_padded = pad_sequence(input_ids, batch_first=True, padding_value=model.tokenizer.pad_token_id)
         labels_padded = pad_sequence(labels, batch_first=True, padding_value=-100)  # Using -100 to ignore padding in loss calculation
         attention_masks_padded = pad_sequence(attention_masks, batch_first=True, padding_value=0)  # Pad attention masks with zeros
@@ -129,55 +134,58 @@ def load_data_and_setup_dataloader(model):
             "labels": labels_padded,
             "attention_mask": attention_masks_padded
         }
-    
-    
+
     class PromptCompletionDataset(Dataset):
-        def __init__(self, prompts: List[str], completion: List[str], tokenizer):
+        def __init__(self, prompts: List[str], completions: List[str], tokenizer):
             self.prompts = prompts
-            self.completion = completion
+            self.completions = completions
             self.tokenizer = tokenizer
 
         def __len__(self):
             return len(self.prompts)
-        
+
         def __getitem__(self, idx):
             prompt_text = self.prompts[idx]
-            completion_text = self.completion[idx]
-
-            encoded_pair = self.tokenizer(prompt_text + completion_text, return_tensors="pt")
+            completion_text = self.completions[idx]
+            
+            # Tokenize prompt and completion together
+            encoded_pair = self.tokenizer(prompt_text + completion_text, return_tensors='pt')
             input_ids = encoded_pair.input_ids.squeeze(0)
-            attention_mask = encoded_pair.input_ids.squeeze(0)
+            attention_mask = encoded_pair.attention_mask.squeeze(0)  # Create attention mask
 
-            prompt_ids = self.tokenizer(prompt_text, add_special_tokens=False)
-            completion_ids = self.tokenizer(completion_text, add_special_tokens=False)
-            labels = [-100] * len(prompt_ids) + completion_ids
+            # Tokenize completion alone for labels, setting labels for prompt to -100
+            prompt_ids = self.tokenizer(prompt_text, add_special_tokens=False).input_ids
+            completion_ids = self.tokenizer(completion_text, add_special_tokens=False).input_ids
+            labels = [-100] * len(prompt_ids) + completion_ids  # Ignore prompt tokens in loss calculation
 
             return {
                 "input_ids": input_ids,
                 "labels": torch.tensor(labels),
-                "attention_mask": attention_mask
+                "attention_mask": attention_mask  # Include attention mask
             }
-        
+            
     class CustomBatchSampler(Sampler):
         def __init__(self, data_source, batch_size):
             self.data_source = data_source
             self.batch_size = batch_size
             self.num_batches = len(data_source) // batch_size
-            self.batch_indicies = list(range(self.num_batches))
-
+            self.batch_indices = list(range(self.num_batches))
+            
         def __iter__(self):
-            random.shuffle(self.batch_indicies)
-            for batch_idx in self.batch_indicies:
+            random.shuffle(self.batch_indices) # Shuffle the order of batches
+            for batch_idx in self.batch_indices:
                 batch_start = batch_idx * self.batch_size
-                batch_indicies = list(range(batch_start, batch_start+ self.batch_size))
-                random.shuffle(batch_indicies)
-                for idx in batch_indicies:
+                batch_indices = list(range(batch_start, batch_start + self.batch_size))
+                random.shuffle(batch_indices) # Shuffle indices within the batch
+                for idx in batch_indices:
                     yield idx
+
         def __len__(self):
             return self.num_batches * self.batch_size
+            
     dataset = PromptCompletionDataset(train_prompts, train_labels, model.tokenizer)
-    dataloader = DataLoader(dataset, batch_size=batch_size, collate_fn=collate_batch, sampler=CustomBatchSampler(dataset, batch_size,))
-    return dataloader, pos_label_token_id, neg_label_token_id
+    dataloader = DataLoader(dataset, batch_size=batch_size, collate_fn=collate_batch, sampler=CustomBatchSampler(dataset, batch_size)) 
+    return dataloader, pos_label_token_id, neg_label_token_id  
 
 
 HF_TOKEN = "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"
