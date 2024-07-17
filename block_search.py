@@ -181,8 +181,8 @@ def load_data_and_setup_dataloader(model):
 
 
     
-outputdir = "./"
-datadir = "./"
+outputdir = ""
+datadir = "data/"
 model_path: str = "meta-llama/Llama-2-7b-chat-hf"
 device: str = "cuda" if torch.cuda.is_available() else "cpu"
 cand_blocks_tokloss=["mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"]
@@ -193,7 +193,6 @@ cand_blocks_projloss=["attn.q_", "attn.k_", "attn.v_", "attn.o_"]
 block_sets_projloss = []
 for k in range(len(cand_blocks_projloss)):
     n_choose_k(cand_blocks_projloss, k+1, block_sets_projloss, [])
-
 
 
 layers_to_train = [18, 19, 20, 21, 22, 23]
@@ -211,7 +210,7 @@ learning_rate = 5e-5
 batch_size=4
 activation_storage = defaultdict(lambda: defaultdict(list))
 
-fname = 'directions_llama2_7b_f16_persona_lasttoken_pc2raw.pkl'
+fname = 'directions_llama2_13b_f16_persona_lasttoken_pc2raw.pkl'
 with open(outputdir+fname, 'rb') as f:
     directions = pickle.load()
 
