@@ -76,7 +76,7 @@ def n_choose_k(choices, k, sets, arr):
 def warmup_lambda(step):
     return min(1.0, step/warmup_steps)
 
-def soft_targets_cross_entropy(logits):
+def soft_target_cross_entropy(logits):
     log_softmax_logits = F.log_softmax(logits, dim=1)
     return -(soft_targets.to(log_softmax_logits.device)*log_softmax_logits).sum(dim=1).mean()
 
@@ -232,31 +232,32 @@ for hp_idx_tok in range(len(block_sets_tokloss)):
         torch.cuda.empty_cache()
         model = load_model(model_path, device)
         model.config.use_cache = False
+        model.config.pretraining_tp = 1 #for llama
         model.tokenizer.padding_side = "right"
-        if hp_idx_tok+hp_idx_proj == 0:
+        if hp_idx_tok+hp_idx_proj == 0: 
             dataloader, pos_label_token_id, neg_label_token_id = load_data_and_setup_dataloader(model)
             total_steps = (len(dataloader)) * num_epochs
-            warmup_steps = total_steps // 20
+            warmup_steps = total_steps // 20  
             soft_targets = torch.zeros(batch_size, model.config.vocab_size)
             for i in range(batch_size):
                 soft_targets[i, pos_label_token_id] = 0.5
                 soft_targets[i, neg_label_token_id] = 0.5
-        
-        token_loss_params = []
+
+        token_loss_params=[]
         projection_loss_params=[]
         for name, param in model.named_parameters():
-            need=False
-            if (name.startswith(layer_prefix) and int(name.split('.')[2] in layers_to_train)):
+            need = False
+            if (name.startswith(layer_prefix) and int(name.split('.')[2]) in layers_to_train):
                 for b in range(len(block_sets_tokloss[hp_idx_tok])):
                     if block_sets_tokloss[hp_idx_tok][b] in name:
                         token_loss_params.append(param)
-                        need=True
-                for b in range(len(block_sets_projloss[hp_idx_tok])):
+                        need = True
+                for b in range(len(block_sets_projloss[hp_idx_proj])):
                     if block_sets_projloss[hp_idx_proj][b] in name:
                         projection_loss_params.append(param)
-                        need=True
-            param.require_grad = True if need else False
-
+                        need = True
+            param.requires_grad = True if need else False
+            
         clear_hooks(model)
 
         optimizer = torch.optim.AdamW([
@@ -270,39 +271,40 @@ for hp_idx_tok in range(len(block_sets_tokloss)):
 
         token_losses = []
         projection_losses = []
+        firstbatch_tokloss = firstbatch_projloss = 0
         for epoch in range(num_epochs):
             model.train()
             for bi, batch in enumerate(tqdm(dataloader)):
                 optimizer.zero_grad()
-                last_token_position = (batch['attention_mask'].sum(dim=1) - key_token_offset).tolist()
-                layer_positions = {}
+                last_token_positions = (batch['attention_mask'].sum(dim=1) - key_token_offset).tolist()
+                layers_positions = {}
                 for layer in layers_to_train:
-                    layer_positions[layer] = [[pos-i for i in range(priortoks,-1,-1)] for pos in last_token_position]
+                    layers_positions[layer] = [[pos-i for i in range(priortoks,-1,-1)] for pos in last_token_positions]
 
-                attach_activation_hooks(model, layer_positions, activation_storage, "end")
-                inputs = {k: v.to(device) for k,v in batch.items()}
+                attach_activation_hooks(model, layers_positions, activation_storage, "end")
+                inputs = {k: v.to(device) for k, v in batch.items()}
                 outputs = model(**inputs)
-                logits = outputs.logit[:, -1, :]
-                loss = soft_targets_cross_entropy(logits)
+                logits = outputs.logits[:, -1, :]  # Logits of last output token
+                loss = soft_target_cross_entropy(logits)
                 
-                skip_token_loss = loss.item() < 0.7 * 5
-                if not skip_token_loss:
-                    loss += 0.1
-                    projection_handles = attach_zerograd_hooks(set(projection_loss_params)-set(token_loss_params))
+                skip_token_loss = loss.item() < 0.7 * 5 # no need to do this if you're already close to the theoretical min of -ln(0.5); save time and prevent overfitting
+                if not skip_token_loss: 
+                    loss*=0.1
+                    projection_handles = attach_zerograd_hooks(set(projection_loss_params) - set(token_loss_params))
                     loss.backward(retain_graph=True)
                     remove_zerograd_hooks(projection_handles)
-                
+
                 cum_projection_loss = 0
-                for layer, position in activation_storage.items():
-                    for pos, tensor_list in position.items():
+                for layer, positions in activation_storage.items():
+                    for pos, tensor_list in positions.items():#each of these is a list of batchsize d-embed tensors for a given position
                         batch_tensor = torch.stack(tensor_list, dim=0)
                         direction = (directions[layer][pos] * (-1 if flip_direction else 1)).to(batch_tensor.device)
                         projection = (batch_tensor @ direction) / (torch.norm(direction) * torch.norm(batch_tensor, dim=1))
-                        if train_direction_in: projection_loss = ((1-projection) / 2) * .1
-                        else: projection_loss = torch.abs(projection)
-                        cum_projection_loss += projection_loss.mean()
-                    
-                if not skip_token_loss: token_handles = attach_zerograd_hooks(set(token_loss_params)-set(projection_loss_params))
+                        if train_direction_in: projection_loss = ((1 - projection) / 2) * .1# ranges from 0 for perfect alignment to 1 for perfect anti-alignment
+                        else: projection_loss = torch.abs(projection) # 0 if no projection, 1 if perfect anti-alignment
+                        cum_projection_loss += projection_loss.mean() / (len(layers_to_train) * len(positions.items())) #average over batch, as with token loss        
+
+                if not skip_token_loss: token_handles = attach_zerograd_hooks(set(token_loss_params) - set(projection_loss_params))
                 cum_projection_loss.backward()
                 if not skip_token_loss: remove_zerograd_hooks(token_handles)
 
@@ -318,7 +320,7 @@ for hp_idx_tok in range(len(block_sets_tokloss)):
                     firstbatch_projloss = cum_projection_loss
                 if epoch==num_epochs-1 and bi>= len(dataloader)-10:
                     token_losses.append(loss.item())
-                    projection_loss.append(cum_projection_loss.item())
+                    projection_losses.append(cum_projection_loss.item())
 
         if num_epochs>1: print(f"Epoch {epoch+1}/{num_epochs}")
         last10_tokloss=sum(token_losses)/len(token_losses)
